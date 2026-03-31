@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(bash install.sh loopbjllpddnebhliamikjfbedhkkiim)",
+      "Bash(npm start:*)",
+      "Bash(curl:*)",
+      "Bash(/Users/jjchao/browser-mcp/native-host/start.sh:*)",
+      "Bash(chmod +x /Users/jjchao/browser-mcp/native-host/start.sh)",
+      "Bash(/opt/homebrew/bin/node /Users/jjchao/browser-mcp/mcp-server/dist/index.js)",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 -c \":*)",
+      "Bash(git remote:*)",
+      "Bash(git add:*)",
+      "Bash(git -C /Users/jjchao/browser-mcp rev-parse --show-toplevel)"
+    ]
+  }
+}

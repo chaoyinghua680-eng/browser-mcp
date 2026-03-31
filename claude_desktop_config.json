@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "browser-mcp": {
+      "command": "node",
+      "args": ["D:\\VS_Projects\\browser-mcp\\mcp-server\\dist\\index.js"]
+    }
+  }
+}

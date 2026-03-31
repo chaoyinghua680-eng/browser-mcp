@@ -1,0 +1,9 @@
+{
+    "path":  "D:\\VS_Projects\\browser-mcp\\native-host\\start.cmd",
+    "description":  "Browser MCP Native Messaging Host",
+    "name":  "com.browsermcp.host",
+    "allowed_origins":  [
+                            "chrome-extension://ogcjnocfoehegicpepjokackdfghbmnh/"
+                        ],
+    "type":  "stdio"
+}

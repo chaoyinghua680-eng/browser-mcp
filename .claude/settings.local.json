@@ -13,7 +13,15 @@
       "Bash(python3 -c \":*)",
       "Bash(git remote:*)",
       "Bash(git add:*)",
-      "Bash(git -C /Users/jjchao/browser-mcp rev-parse --show-toplevel)"
+      "Bash(git -C /Users/jjchao/browser-mcp rev-parse --show-toplevel)",
+      "Read(//Users/jjchao/**)",
+      "Bash(lsof -ti:3282)",
+      "Bash(xargs kill:*)",
+      "Bash(lsof -i:3282)",
+      "Bash(xargs ps:*)",
+      "Bash(kill 12211)",
+      "Bash(npm list:*)",
+      "Bash(ls:*)"
     ]
   }
 }

@@ -3,8 +3,9 @@
 //  职责：
 //  1. 与 Native Host 保持 Native Messaging 长连接
 //  2. 收到 EXECUTE_SCRIPT 指令后，路由到对应 Tab
-//  3. 通过 chrome.tabs.sendMessage 转发给 User Script
-//  4. 将执行结果原路回传给 Native Host
+//  3. 先 Ping 检测脚本是否已注入，未注入则 Reload Tab
+//  4. 通过 chrome.tabs.sendMessage 转发给 User Script
+//  5. 将执行结果原路回传给 Native Host
 // ────────────────────────────────────────────────
 
 const NATIVE_HOST_NAME = "com.browsermcp.host";
@@ -36,7 +37,6 @@ function connectNative() {
         };
       }
 
-      // 回传结果给 Native Host（再转发给 MCP Server）
       nativePort?.postMessage(responsePayload);
     });
 
@@ -59,7 +59,6 @@ async function executeScript(
   scriptName: string,
   params: Record<string, unknown>
 ): Promise<unknown> {
-  // 从 storage 读取脚本配置
   const { scripts } = await chrome.storage.local.get("scripts") as {
     scripts?: Record<string, { targetUrl: string; code: string }>;
   };
@@ -69,41 +68,67 @@ async function executeScript(
     throw new Error(`脚本未注册: ${scriptName}，请在插件 Popup 中安装`);
   }
 
+  // 确保 userScript 已注册（新 Tab / 刷新后会自动注入）
+  await ensureUserScriptRegistered(scriptName, scriptConfig);
+
   // 找到或新开目标 Tab
   const tab = await findOrOpenTab(scriptConfig.targetUrl);
   if (!tab.id) throw new Error("无法获取 Tab ID");
 
-  // 确保 User Script 已通过 userScripts API 注册
-  await ensureUserScriptRegistered(scriptName, scriptConfig);
+  // Ping 检测脚本是否已注入，未注入则 Reload
+  await ensureScriptInjected(tab.id);
 
-  // 通过 chrome.tabs.sendMessage 通知 User Script 执行
-  // User Script 用 chrome.runtime.onMessage 接收（需配置 messaging: true）
+  // 发送正式执行请求
+  return sendMessageToTab(tab.id, { type: "RUN_SCRIPT", scriptName, params });
+}
+
+// ── Ping + 按需 Reload ────────────────────────
+async function ensureScriptInjected(tabId: number): Promise<void> {
+  try {
+    const res = await Promise.race([
+      chrome.tabs.sendMessage(tabId, { type: "PING" }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 1000)
+      ),
+    ]) as { type: string } | undefined;
+
+    if (res?.type === "PONG") return; // 脚本已就绪
+  } catch {
+    // 无响应，说明 Tab 是在脚本注册前打开的，需要刷新
+  }
+
+  console.log(`[BrowserMCP] Tab ${tabId} 无脚本，刷新注入...`);
+  await reloadAndWait(tabId);
+}
+
+// ── 向 Tab 发消息（带超时）────────────────────
+function sendMessageToTab(
+  tabId: number,
+  message: Record<string, unknown>,
+  timeoutMs = 30_000
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("User Script 响应超时（15s）")),
-      15_000
+    const timer = setTimeout(
+      () => reject(new Error(`User Script 响应超时（${timeoutMs / 1000}s）`)),
+      timeoutMs
     );
 
-    chrome.tabs.sendMessage(
-      tab.id!,
-      { type: "RUN_SCRIPT", scriptName, params },
-      (response) => {
-        clearTimeout(timeout);
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!response) {
-          reject(new Error("User Script 无响应，请确认脚本已正确注册"));
-          return;
-        }
-        if (response.error) {
-          reject(new Error(response.error));
-        } else {
-          resolve(response.data);
-        }
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      clearTimeout(timer);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
       }
-    );
+      if (!response) {
+        reject(new Error("User Script 无响应"));
+        return;
+      }
+      if (response.error) {
+        reject(new Error(response.error));
+      } else {
+        resolve(response.data);
+      }
+    });
   });
 }
 
@@ -113,16 +138,39 @@ async function ensureUserScriptRegistered(
   config: { targetUrl: string; code: string }
 ) {
   const existing = await chrome.userScripts.getScripts({ ids: [scriptName] });
-  if (existing.length > 0) return; // 已注册，跳过
+  if (existing.length > 0) return;
 
   const origin = new URL(config.targetUrl).origin;
+
+  // 包装用户代码：添加 PING/RUN_SCRIPT 消息监听
+  const wrappedCode = `
+(function() {
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === "PING") {
+      sendResponse({ type: "PONG" });
+      return true;
+    }
+    if (request.type === "RUN_SCRIPT") {
+      (async () => {
+        ${config.code}
+      })().then(data => {
+        sendResponse({ data });
+      }).catch(err => {
+        sendResponse({ error: err.message || String(err) });
+      });
+      return true;
+    }
+  });
+})();
+`;
+
   await chrome.userScripts.register([
     {
       id: scriptName,
       matches: [`${origin}/*`],
-      js: [{ code: config.code }],
-      runAt: "document_idle",
-      world: "USER_SCRIPT", // 独立沙箱，不污染页面全局
+      js: [{ code: wrappedCode }],
+      runAt: "document_end",
+      world: "USER_SCRIPT",
     },
   ]);
 }
@@ -136,14 +184,17 @@ async function findOrOpenTab(targetUrl: string): Promise<chrome.tabs.Tab> {
     return tabs[0];
   }
 
-  // 没有匹配的 Tab，新开一个并等待加载完成
+  return openAndWait(targetUrl);
+}
+
+function openAndWait(url: string): Promise<chrome.tabs.Tab> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error(`打开 ${targetUrl} 超时`)),
+    const timer = setTimeout(
+      () => reject(new Error(`打开 ${url} 超时`)),
       30_000
     );
 
-    chrome.tabs.create({ url: targetUrl }, (tab) => {
+    chrome.tabs.create({ url }, (tab) => {
       const listener = (
         tabId: number,
         info: chrome.tabs.TabChangeInfo,
@@ -151,7 +202,7 @@ async function findOrOpenTab(targetUrl: string): Promise<chrome.tabs.Tab> {
       ) => {
         if (tabId === tab.id && info.status === "complete") {
           chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timeout);
+          clearTimeout(timer);
           resolve(updatedTab);
         }
       };
@@ -160,26 +211,50 @@ async function findOrOpenTab(targetUrl: string): Promise<chrome.tabs.Tab> {
   });
 }
 
-// ── 插件安装/启动时初始化 ─────────────────────
+function reloadAndWait(tabId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("Tab 刷新超时")),
+      30_000
+    );
+
+    const listener = (
+      updatedTabId: number,
+      info: chrome.tabs.TabChangeInfo
+    ) => {
+      if (updatedTabId === tabId && info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId);
+  });
+}
+
+// ── 插件安装/更新时初始化 ─────────────────────
 chrome.runtime.onInstalled.addListener(async () => {
-  // userScripts API 需要在 chrome://extensions 中为本插件开启「允许访问文件网址」
-  // 以及 Chrome 需处于开发者模式，否则 chrome.userScripts 为 undefined
   if (!chrome.userScripts) {
     console.error(
       "[BrowserMCP] chrome.userScripts 不可用！\n" +
-      "请到 chrome://extensions → 找到 Browser MCP → 开启「在开发者模式下允许」"
+      "请到 chrome://extensions → 找到 Browser MCP → 开启开发者模式"
     );
     return;
   }
-  // 开启 userScripts messaging 模式（允许沙箱内使用 chrome.runtime.onMessage）
-  await chrome.userScripts.configureWorld({
-    messaging: true,
-  });
+  await chrome.userScripts.configureWorld({ messaging: true });
   console.log("[BrowserMCP] userScripts world messaging 已启用");
 });
 
 // 启动 Native Messaging 连接
 connectNative();
 
-// 强制 tsc 将此文件识别为 ES module（Service Worker type: module 要求）
+// ── Service Worker 保活（MV3 会在 30s 无活动后挂起）──
+chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== "keepAlive") return;
+  if (!nativePort) connectNative();
+});
+
 export {};

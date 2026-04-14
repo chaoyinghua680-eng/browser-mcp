@@ -8,7 +8,7 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      width: 360px;
+      width: 320px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 13px;
       color: #1a1a1a;
@@ -37,7 +37,7 @@
     section { padding: 12px 16px; border-bottom: 1px solid #e8eaed; background: #fff; }
     section h2 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
 
-    /* 已安装脚本列表 */
+    /* 已安装脚本列表（只读） */
     #script-list { display: flex; flex-direction: column; gap: 6px; }
     .script-item {
       display: flex;
@@ -46,67 +46,40 @@
       background: #f7f8fa;
       border-radius: 6px;
       border: 1px solid #e8eaed;
+      gap: 8px;
     }
-    .script-item .name { flex: 1; font-weight: 500; }
-    .script-item .url { font-size: 11px; color: #888; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .script-item button {
-      border: none;
-      background: #fee2e2;
-      color: #dc2626;
-      border-radius: 4px;
-      padding: 3px 8px;
-      cursor: pointer;
-      font-size: 12px;
+    .script-item.disabled { opacity: .55; }
+    .script-item .info { flex: 1; min-width: 0; }
+    .script-item .name { font-weight: 500; }
+    .script-item .url { font-size: 11px; color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #16c784;
+      flex-shrink: 0;
     }
-    .script-item button:hover { background: #fca5a5; }
+    .status-dot.off { background: #d1d5db; }
     #no-scripts { color: #aaa; font-size: 12px; padding: 4px 0; }
 
-    /* 安装新脚本表单 */
-    #install-form label {
-      display: block;
-      font-size: 12px;
-      color: #555;
-      margin-bottom: 3px;
-      margin-top: 8px;
-    }
-    #install-form label:first-child { margin-top: 0; }
-    #install-form input,
-    #install-form textarea {
-      width: 100%;
-      border: 1px solid #d1d5db;
-      border-radius: 5px;
-      padding: 6px 8px;
-      font-size: 12px;
-      font-family: inherit;
-      outline: none;
-      transition: border-color .15s;
-    }
-    #install-form input:focus,
-    #install-form textarea:focus { border-color: #6366f1; }
-    #install-form textarea { height: 80px; resize: vertical; font-family: "SF Mono", monospace; }
-
-    #install-btn {
-      margin-top: 10px;
-      width: 100%;
-      padding: 8px;
+    /* 管理按钮 */
+    .manage-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      margin: 14px 16px;
+      padding: 9px;
       background: #6366f1;
       color: #fff;
       border: none;
-      border-radius: 6px;
+      border-radius: 7px;
       cursor: pointer;
       font-size: 13px;
       font-weight: 500;
+      width: calc(100% - 32px);
     }
-    #install-btn:hover { background: #4f46e5; }
-    #install-btn:disabled { background: #a5b4fc; cursor: not-allowed; }
-
-    #status-msg {
-      margin-top: 8px;
-      font-size: 12px;
-      min-height: 16px;
-      color: #16c784;
-    }
-    #status-msg.error { color: #dc2626; }
+    .manage-btn:hover { background: #4f46e5; }
   </style>
 </head>
 <body>
@@ -119,26 +92,11 @@
   <section>
     <h2>已安装脚本</h2>
     <div id="script-list">
-      <p id="no-scripts">暂无脚本，请在下方安装</p>
+      <p id="no-scripts">暂无脚本</p>
     </div>
   </section>
 
-  <section>
-    <h2>安装新脚本</h2>
-    <div id="install-form">
-      <label for="script-name">工具名称（英文，对应 MCP Tool 名）</label>
-      <input id="script-name" type="text" placeholder="例: get_taobao_orders" />
-
-      <label for="target-url">目标网址</label>
-      <input id="target-url" type="url" placeholder="例: https://buyertrade.taobao.com/" />
-
-      <label for="script-code">脚本代码（JS）</label>
-      <textarea id="script-code" placeholder="粘贴脚本代码..."></textarea>
-
-      <button id="install-btn">安装脚本</button>
-      <p id="status-msg"></p>
-    </div>
-  </section>
+  <button class="manage-btn" id="manage-btn">⚙️ 管理脚本</button>
 
   <script src="../dist/popup/popup.js" type="module"></script>
 </body>

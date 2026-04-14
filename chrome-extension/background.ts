@@ -60,12 +60,16 @@ async function executeScript(
   params: Record<string, unknown>
 ): Promise<unknown> {
   const { scripts } = await chrome.storage.local.get("scripts") as {
-    scripts?: Record<string, { targetUrl: string; code: string }>;
+    scripts?: Record<string, { targetUrl: string; code: string; enabled?: boolean }>;
   };
 
   const scriptConfig = scripts?.[scriptName];
   if (!scriptConfig) {
     throw new Error(`脚本未注册: ${scriptName}，请在插件 Popup 中安装`);
+  }
+
+  if (scriptConfig.enabled === false) {
+    throw new Error(`脚本 ${scriptName} 已被禁用，请在脚本管理页面中启用`);
   }
 
   // 确保 userScript 已注册（新 Tab / 刷新后会自动注入）

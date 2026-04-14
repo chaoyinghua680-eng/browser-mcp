@@ -10,6 +10,6 @@
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["background.ts", "popup/popup.ts"],
+  "include": ["background.ts", "popup/popup.ts", "manager/manager.ts"],
   "exclude": ["node_modules", "dist"]
 }

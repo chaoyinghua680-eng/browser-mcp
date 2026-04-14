@@ -152,12 +152,34 @@ async function saveScript() {
     // 注销旧版 userScript（若存在）
     try { await chrome.userScripts.unregister({ ids: [name] }); } catch { /* 忽略 */ }
 
-    // 重新注册（enabled 默认 true）
+    // 重新注册时包装 PING/RUN_SCRIPT 消息层，与 background.ts 的
+    // ensureUserScriptRegistered() 保持一致，避免 PING 超时导致 Tab 无限 reload
+    // ⚠️ storage 里存的始终是用户原始代码（不含包装），background 执行时会自行包装
+    const wrappedCode = `
+(function() {
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === "PING") {
+      sendResponse({ type: "PONG" });
+      return true;
+    }
+    if (request.type === "RUN_SCRIPT") {
+      (async () => {
+        ${code}
+      })().then(data => {
+        sendResponse({ data });
+      }).catch(err => {
+        sendResponse({ error: err.message || String(err) });
+      });
+      return true;
+    }
+  });
+})();
+`;
     await chrome.userScripts.register([{
       id: name,
       matches: [`${origin}/*`],
-      js: [{ code }],
-      runAt: "document_idle",
+      js: [{ code: wrappedCode }],
+      runAt: "document_end",   // 与 background.ts ensureUserScriptRegistered 保持一致
       world: "USER_SCRIPT",
     }]);
 

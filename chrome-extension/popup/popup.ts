@@ -3,6 +3,8 @@ interface ScriptConfig {
   targetUrl: string;
   code: string;
   enabled?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
 }
 type ScriptsStore = Record<string, ScriptConfig>;
 
@@ -70,3 +72,7 @@ function escapeHtml(str: string) {
 // ── 初始化 ────────────────────────────────────
 checkConnectionStatus();
 loadScripts();
+// 每 3 秒轮询一次连接状态（与 manager 保持一致）
+setInterval(checkConnectionStatus, 3000);
+
+export {};

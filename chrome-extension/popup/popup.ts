@@ -14,12 +14,12 @@ const manageBtn  = document.getElementById("manage-btn")       as HTMLButtonElem
 // ── 连接状态检测 ──────────────────────────────
 async function checkConnectionStatus() {
   try {
-    await fetch("http://127.0.0.1:3282/health", { signal: AbortSignal.timeout(1500) });
-    badge.textContent = "已连接";
-    badge.className = "badge";
+    const res = await chrome.runtime.sendMessage({ type: "GET_CONNECTION_STATUS" }) as { connected: boolean };
+    badge.textContent = res.connected ? "已连接" : "未连接";
+    badge.className   = res.connected ? "badge"  : "badge disconnected";
   } catch {
     badge.textContent = "未连接";
-    badge.className = "badge disconnected";
+    badge.className   = "badge disconnected";
   }
 }
 

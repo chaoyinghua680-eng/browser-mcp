@@ -251,6 +251,14 @@ chrome.runtime.onInstalled.addListener(async () => {
   console.log("[BrowserMCP] userScripts world messaging 已启用");
 });
 
+// ── 连接状态查询（供管理页面/popup 调用）────────
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === "GET_CONNECTION_STATUS") {
+    sendResponse({ connected: nativePort !== null });
+    return true;
+  }
+});
+
 // 启动 Native Messaging 连接
 connectNative();
 

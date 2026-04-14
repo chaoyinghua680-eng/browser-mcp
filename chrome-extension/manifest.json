@@ -6,6 +6,7 @@
   "permissions": [
     "nativeMessaging",
     "userScripts",
+    "scripting",
     "storage",
     "tabs",
     "alarms"

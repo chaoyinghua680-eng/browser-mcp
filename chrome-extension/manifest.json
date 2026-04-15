@@ -14,7 +14,8 @@
   "host_permissions": [
     "https://*.taobao.com/*",
     "https://*.tmall.com/*",
-    "https://*.jd.com/*"
+    "https://*.jd.com/*",
+    "https://chat.deepseek.com/*"
   ],
   "background": {
     "service_worker": "dist/background.js",

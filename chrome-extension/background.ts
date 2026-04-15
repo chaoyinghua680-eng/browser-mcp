@@ -10,8 +10,12 @@
 // ────────────────────────────────────────────────
 
 const NATIVE_HOST_NAME = "com.browsermcp.host";
+const DEEPSEEK_MARKER = "browsermcp=1";
+const DEEPSEEK_MARKER_URL = `https://chat.deepseek.com/?${DEEPSEEK_MARKER}`;
 
 let nativePort: chrome.runtime.Port | null = null;
+let deepseekBusy = false;
+let deepseekTabId: number | null = null;
 
 // ── Native Messaging 连接管理 ─────────────────
 function connectNative() {
@@ -60,6 +64,22 @@ async function executeScript(
   scriptName: string,
   params: Record<string, unknown>
 ): Promise<unknown> {
+  // 内建 DeepSeek：完全绕开 userScripts 链路
+  if (scriptName === "deepseek_send_message") {
+    if (deepseekBusy) {
+      throw new Error("[DeepSeek] 正在处理中，请等待上一个请求完成");
+    }
+
+    deepseekBusy = true;
+    try {
+      const tab = await findOrOpenDeepSeekTab();
+      if (!tab.id) throw new Error("[DeepSeek] 无法获取 Tab ID");
+      return await executeDeepSeekInMainWorld(tab.id, params);
+    } finally {
+      deepseekBusy = false;
+    }
+  }
+
   const { scripts } = await chrome.storage.local.get("scripts") as {
     scripts?: Record<string, { targetUrl: string; code: string }>;
   };
@@ -105,6 +125,207 @@ async function executeTaobaoOrdersInMainWorld(
   if (!result) throw new Error("MAIN world 执行无返回");
   if (result.error) throw new Error(result.error);
   return result.data;
+}
+
+// ── DeepSeek：MAIN world UI 自动化 ─────────────
+async function executeDeepSeekInMainWorld(
+  tabId: number,
+  params: Record<string, unknown>
+): Promise<unknown> {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: deepseekMainWorldFunc,
+    args: [params],
+  });
+
+  const result = results?.[0]?.result as { data?: unknown; error?: string } | undefined;
+  if (!result) {
+    throw new Error("[DeepSeek] MAIN world 执行无返回，请确认 chat.deepseek.com 页面已加载完成");
+  }
+  if (result.error) throw new Error(result.error);
+  return result.data;
+}
+
+// 此函数会被序列化后在页面 MAIN world 中执行
+// 不能引用外部变量，必须完全自包含
+async function deepseekMainWorldFunc(params: Record<string, unknown>) {
+  try {
+    const message = typeof params.message === "string" ? params.message.trim() : "";
+    if (!message) {
+      return { error: "[DeepSeek] message 不能为空" };
+    }
+
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const waitFor = async <T>(
+      getValue: () => T | null,
+      timeoutMs: number,
+      intervalMs = 100
+    ): Promise<T | null> => {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < timeoutMs) {
+        const value = getValue();
+        if (value) return value;
+        await sleep(intervalMs);
+      }
+      return null;
+    };
+
+    const getTextarea = () => {
+      const preferred = document.querySelector('textarea[placeholder="Message DeepSeek"]');
+      if (preferred instanceof HTMLTextAreaElement) return preferred;
+      const fallback = document.querySelector("textarea");
+      return fallback instanceof HTMLTextAreaElement ? fallback : null;
+    };
+
+    const getSendButton = () => {
+      const preferred = document.querySelector('[role="button"].bd74640a');
+      if (preferred instanceof HTMLElement) return preferred;
+
+      const fallback = document
+        .querySelector('svg path[d^="M8.3125"]')
+        ?.closest('[role="button"]');
+      return fallback instanceof HTMLElement ? fallback : null;
+    };
+
+    const getMarkdownNodes = () =>
+      Array.from(document.querySelectorAll(".ds-markdown")).filter(
+        (node): node is HTMLElement => node instanceof HTMLElement
+      );
+
+    const getLatestContent = () => {
+      const nodes = getMarkdownNodes();
+      return nodes[nodes.length - 1]?.innerText.trim() ?? "";
+    };
+
+    const isButtonDisabled = (button: HTMLElement | null) =>
+      !button ||
+      button.classList.contains("ds-icon-button--disabled") ||
+      button.getAttribute("aria-disabled") === "true" ||
+      button.hasAttribute("disabled");
+
+    const triggerClick = (button: HTMLElement) => {
+      button.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      button.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      button.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    };
+
+    const textarea = await waitFor(getTextarea, 10_000);
+    if (!textarea) {
+      return { error: "[DeepSeek] 未找到输入框，请确认页面已完全加载并已登录" };
+    }
+
+    textarea.focus();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      "value"
+    )?.set;
+
+    if (nativeSetter) {
+      nativeSetter.call(textarea, message);
+    } else {
+      textarea.value = message;
+    }
+
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const sendButton = await waitFor(getSendButton, 3_000);
+    if (!sendButton) {
+      return { error: "[DeepSeek] 未找到发送按钮，页面结构可能已更新" };
+    }
+
+    const enabledButton = await waitFor(
+      () => {
+        const button = getSendButton();
+        return isButtonDisabled(button) ? null : button;
+      },
+      3_000
+    );
+
+    if (!enabledButton) {
+      return { error: "[DeepSeek] 发送按钮未激活，消息可能未被接受" };
+    }
+
+    const previousCount = getMarkdownNodes().length;
+    const previousText = getLatestContent();
+    enabledButton.click();
+
+    const responseStarted = await waitFor(() => {
+      const nodes = getMarkdownNodes();
+      const latestText = getLatestContent();
+      const button = getSendButton();
+
+      if (nodes.length > previousCount) return nodes[nodes.length - 1];
+      if (latestText && latestText !== previousText) return true;
+      if (button && isButtonDisabled(button)) return true;
+      return null;
+    }, 30_000);
+
+    if (!responseStarted) {
+      const fallbackButton = getSendButton();
+      if (fallbackButton && fallbackButton !== enabledButton && !isButtonDisabled(fallbackButton)) {
+        triggerClick(fallbackButton);
+      } else if (!isButtonDisabled(enabledButton)) {
+        triggerClick(enabledButton);
+      }
+
+      const retryStarted = await waitFor(() => {
+        const nodes = getMarkdownNodes();
+        const latestText = getLatestContent();
+        const button = getSendButton();
+
+        if (nodes.length > previousCount) return true;
+        if (latestText && latestText !== previousText) return true;
+        if (button && isButtonDisabled(button)) return true;
+        return null;
+      }, 10_000);
+
+      if (!retryStarted) {
+        return { error: "[DeepSeek] 等待回复超时（30s），请检查页面状态" };
+      }
+    }
+
+    const timeoutSeconds = typeof params.timeout === "number" ? params.timeout : 120;
+    const maxWaitMs = Math.max(5, timeoutSeconds) * 1000;
+    const replyStartedAt = Date.now();
+    let lastText = "";
+    let stableCount = 0;
+
+    while (Date.now() - replyStartedAt < maxWaitMs) {
+      await sleep(500);
+
+      const currentText = getLatestContent();
+      if (currentText && currentText === lastText) {
+        stableCount += 1;
+      } else {
+        stableCount = currentText ? 1 : 0;
+        lastText = currentText;
+      }
+
+      const currentButton = getSendButton();
+      if (currentText && currentButton && !isButtonDisabled(currentButton)) {
+        break;
+      }
+
+      if (currentText && stableCount >= 2) {
+        break;
+      }
+    }
+
+    const content = getLatestContent();
+    const hasNewReply = getMarkdownNodes().length > previousCount || content !== previousText;
+    if (!content || !hasNewReply) {
+      return { error: "[DeepSeek] 收到空响应" };
+    }
+
+    return { data: { content } };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { error: "[DeepSeek] 执行异常: " + message };
+  }
 }
 
 // 此函数会被序列化后在页面 MAIN world 中执行
@@ -379,14 +600,42 @@ async function findOrOpenTab(targetUrl: string): Promise<chrome.tabs.Tab> {
   return openAndWait(targetUrl);
 }
 
-function openAndWait(url: string): Promise<chrome.tabs.Tab> {
+async function findOrOpenDeepSeekTab(): Promise<chrome.tabs.Tab> {
+  if (deepseekTabId !== null) {
+    try {
+      const tab = await chrome.tabs.get(deepseekTabId);
+      if (tab.url?.includes("chat.deepseek.com")) {
+        return tab;
+      }
+    } catch {
+      // tab 已关闭，继续向下查找
+    }
+    deepseekTabId = null;
+  }
+
+  const tabs = await chrome.tabs.query({ url: "https://chat.deepseek.com/*" });
+  const markerTab = tabs.find((tab) => tab.url?.includes(DEEPSEEK_MARKER));
+  if (markerTab?.id) {
+    deepseekTabId = markerTab.id;
+    return markerTab;
+  }
+
+  const tab = await openAndWait(DEEPSEEK_MARKER_URL, { active: false });
+  deepseekTabId = tab.id ?? null;
+  return tab;
+}
+
+function openAndWait(
+  url: string,
+  options: Pick<chrome.tabs.CreateProperties, "active"> = {}
+): Promise<chrome.tabs.Tab> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`打开 ${url} 超时`)),
       30_000
     );
 
-    chrome.tabs.create({ url }, (tab) => {
+    chrome.tabs.create({ ...options, url }, (tab) => {
       const listener = (
         tabId: number,
         info: chrome.tabs.TabChangeInfo,

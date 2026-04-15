@@ -144,16 +144,118 @@ app.all("/mcp", async (req: Request, res: Response) => {
   await transport.handleRequest(req, res, req.body);
 });
 
+// ---------- OpenAI 兼容端点（供 Clawith 等客户端直接调用）----------
+app.post("/v1/chat/completions", async (req: Request, res: Response) => {
+  const { messages, model = "deepseek-chat", stream = false } = req.body;
+
+  if (!Array.isArray(messages)) {
+    res.status(400).json({
+      error: { message: "messages 必须是数组", type: "invalid_request_error" },
+    });
+    return;
+  }
+
+  if (
+    messages.length > 1 ||
+    messages.some((message: any) => message?.role !== "user")
+  ) {
+    console.warn(
+      "[sse-server] 警告: 收到多轮消息，当前为 single-turn 模式，只取最后一条 user 消息，system/assistant 均被忽略"
+    );
+  }
+
+  // 取最后一条 user 消息作为输入
+  const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
+  if (!lastUser) {
+    res.status(400).json({ error: { message: "请求中未找到 user 消息", type: "invalid_request_error" } });
+    return;
+  }
+  const message = typeof lastUser.content === "string"
+    ? lastUser.content
+    : Array.isArray(lastUser.content)
+      ? lastUser.content.map((c: any) => c.text ?? "").join("")
+      : "";
+
+  if (!message) {
+    res.status(400).json({ error: { message: "user 消息内容为空", type: "invalid_request_error" } });
+    return;
+  }
+
+  if (model !== "deepseek-chat") {
+    res.status(400).json({
+      error: {
+        message: `不支持的 model: ${model}，当前仅支持 deepseek-chat`,
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  const scriptName = "deepseek_send_message";
+  const scriptParams: Record<string, unknown> = { message };
+
+  console.log(`[sse-server] /v1/chat/completions → ${scriptName} (model=${model})`);
+
+  try {
+    const result = await callNativeHost(scriptName, scriptParams) as any;
+    const content = typeof result?.content === "string" ? result.content : "";
+    if (!content) {
+      throw new Error("[DeepSeek] 收到空响应");
+    }
+
+    if (stream) {
+      // 伪流式：一次性发送完整内容
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      const chunk = {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: "stop" }],
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } else {
+      res.json({
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
+    }
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    const status = errMsg.includes("正在处理中") ? 429 : 502;
+    console.error(`[sse-server] /v1/chat/completions 错误: ${errMsg}`);
+    res.status(status).json({
+      error: {
+        message: errMsg,
+        type: status === 429 ? "rate_limit_error" : "upstream_error",
+      },
+    });
+  }
+});
+
 // 健康检查
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", sessions: transports.size });
 });
 
 // ---------- 启动 ----------
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`[sse-server] MCP SSE Server 已启动`);
-  console.log(`[sse-server]   SSE 端点:    http://localhost:${PORT}/sse`);
-  console.log(`[sse-server]   消息端点:    http://localhost:${PORT}/message`);
-  console.log(`[sse-server]   Streamable:  http://localhost:${PORT}/mcp`);
-  console.log(`[sse-server]   健康检查:    http://localhost:${PORT}/health`);
+  console.log(`[sse-server]   SSE 端点:    http://0.0.0.0:${PORT}/sse`);
+  console.log(`[sse-server]   消息端点:    http://0.0.0.0:${PORT}/message`);
+  console.log(`[sse-server]   Streamable:  http://0.0.0.0:${PORT}/mcp`);
+  console.log(`[sse-server]   OpenAI 兼容: http://0.0.0.0:${PORT}/v1/chat/completions`);
+  console.log(`[sse-server]   健康检查:    http://0.0.0.0:${PORT}/health`);
 });

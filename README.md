@@ -2,6 +2,10 @@
 
 让 AI（Claude Desktop / Cursor）通过 MCP 协议访问你浏览器中已登录的网站数据。
 
+## 文档
+
+- [DeepSeek Browser Transport 说明](/Users/jjchao/project/browser-mcp/docs/deepseek-browser-transport.md)
+
 ## 系统架构
 
 ```

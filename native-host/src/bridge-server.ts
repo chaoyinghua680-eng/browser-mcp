@@ -86,9 +86,9 @@ app.post("/execute", async (req, res) => {
   const timeout = setTimeout(() => {
     if (pendingRequests.has(requestId)) {
       pendingRequests.delete(requestId);
-      res.status(504).json({ error: "等待 Chrome 响应超时（30s）" });
+      res.status(504).json({ error: "等待 Chrome 响应超时（120s）" });
     }
-  }, 30_000);
+  }, 120_000);
 
   const resultPromise = new Promise<unknown>((resolve, reject) => {
     pendingRequests.set(requestId, { resolve, reject });

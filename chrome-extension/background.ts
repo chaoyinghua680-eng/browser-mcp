@@ -74,6 +74,7 @@ async function executeScript(
     try {
       const tab = await findOrOpenDeepSeekTab();
       if (!tab.id) throw new Error("[DeepSeek] 无法获取 Tab ID");
+      await ensureDeepSeekLoggedIn(tab.id);
       return await executeDeepSeekInMainWorld(tab.id, params);
     } finally {
       deepseekBusy = false;
@@ -105,12 +106,142 @@ async function executeScript(
 
   // 淘宝订单：直接在 MAIN world 执行（绕过 Origin 问题）
   if (scriptName === "get_taobao_orders") {
+    // 在 background 层检测登录态，避免页面跳转杀死 MAIN world 函数
+    await ensureTaobaoLoggedIn(tab.id);
     return await executeTaobaoOrdersInMainWorld(tab.id, params);
   }
 
   // 其他脚本：走原有的 user script 消息通道
   const userResult = await sendMessageToTab(tab.id, { type: "RUN_SCRIPT", scriptName, params });
   return userResult;
+}
+
+// ── DeepSeek 登录检测（background 层，页面跳转安全）──
+async function ensureDeepSeekLoggedIn(tabId: number): Promise<void> {
+  const LOGIN_TIMEOUT_MS = 60_000;
+  const CHECK_INTERVAL_MS = 3_000;
+
+  // 通过注入脚本检测输入框是否存在（有输入框 = 已登录）
+  const hasTextarea = async (tid: number) => {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tid },
+        world: "MAIN",
+        func: () => !!document.querySelector('textarea[placeholder="Message DeepSeek"], textarea'),
+      });
+      return results?.[0]?.result === true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await hasTextarea(tabId)) return; // 已登录，直接返回
+
+  console.warn("[BrowserMCP DeepSeek] 未检测到登录态，等待用户登录...");
+
+  // 显示横幅
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        if (document.getElementById("browsermcp-login-banner")) return;
+        const banner = document.createElement("div");
+        banner.id = "browsermcp-login-banner";
+        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
+        banner.textContent = "🔗 Browser MCP：请登录 DeepSeek，登录后将自动继续...";
+        document.body.appendChild(banner);
+      },
+    });
+  } catch { /* 忽略 */ }
+
+  // 轮询等待（background 里轮询，不受页面跳转影响）
+  const startedAt = Date.now();
+  let loggedIn = false;
+  while (Date.now() - startedAt < LOGIN_TIMEOUT_MS) {
+    await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
+
+    // 登录后页面会跳转，需要重新获取当前 DeepSeek Tab
+    const tabs = await chrome.tabs.query({ url: "https://chat.deepseek.com/*" });
+    const currentTab = tabs.find(t => t.id === tabId) ?? tabs[0];
+    if (!currentTab?.id) continue;
+
+    if (await hasTextarea(currentTab.id)) {
+      // 更新 tabId（登录后 tab 可能跳转，id 不变但内容变了）
+      tabId = currentTab.id;
+      loggedIn = true;
+      break;
+    }
+  }
+
+  // 移除横幅
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => document.getElementById("browsermcp-login-banner")?.remove(),
+    });
+  } catch { /* 忽略 */ }
+
+  if (!loggedIn) throw new Error("[DeepSeek] 等待登录超时（60s），请先登录 DeepSeek 后再试");
+  console.log("[BrowserMCP DeepSeek] 登录成功，继续执行");
+}
+
+// ── 淘宝登录检测（在 background 层，页面跳转安全）────
+async function ensureTaobaoLoggedIn(tabId: number): Promise<void> {
+  const LOGIN_TIMEOUT_MS = 60_000;
+  const CHECK_INTERVAL_MS = 2_000;
+
+  // 用 getAll 搜索所有 taobao 域下的 _m_h5_tk
+  const hasCookie = async () => {
+    const cookies = await chrome.cookies.getAll({ name: "_m_h5_tk" });
+    return cookies.some(c => c.domain.includes("taobao.com"));
+  };
+
+  if (await hasCookie()) return; // 已有 cookie，继续（session 是否有效交给后续 API 判断）
+
+  // 未登录：通知 Tab 显示横幅提示
+  console.warn("[BrowserMCP 淘宝] 未登录，等待用户登录...");
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        if (document.getElementById("browsermcp-login-banner")) return;
+        const banner = document.createElement("div");
+        banner.id = "browsermcp-login-banner";
+        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
+        banner.textContent = "🔗 Browser MCP：请登录淘宝，登录后将自动继续获取数据...";
+        document.body.appendChild(banner);
+      },
+    });
+  } catch { /* Tab 可能还在加载，忽略 */ }
+
+  // 轮询等待登录（在 background 里，页面跳转不影响轮询）
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < LOGIN_TIMEOUT_MS) {
+    await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
+    if (await hasCookie()) {
+      // 登录成功，等页面稳定后移除横幅
+      await new Promise(r => setTimeout(r, 1_000));
+      try {
+        // 重新找 Tab（登录后可能跳转到新 URL）
+        const tabs = await chrome.tabs.query({ url: "https://*.taobao.com/*" });
+        const targetTab = tabs.find(t => t.id === tabId) ?? tabs[0];
+        if (targetTab?.id) {
+          await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            func: () => document.getElementById("browsermcp-login-banner")?.remove(),
+          });
+        }
+      } catch { /* 忽略 */ }
+      console.log("[BrowserMCP 淘宝] 登录成功，继续获取数据");
+      return;
+    }
+  }
+
+  throw new Error("等待登录超时（60s），请先登录淘宝后再试");
 }
 
 // ── 淘宝订单：MAIN world 一步执行 ────────────
@@ -125,8 +256,64 @@ async function executeTaobaoOrdersInMainWorld(
     args: [params],
   });
 
-  const result = results?.[0]?.result as { data?: unknown; error?: string } | undefined;
+  const result = results?.[0]?.result as { data?: unknown; error?: string; __needRelogin__?: boolean } | undefined;
   if (!result) throw new Error("MAIN world 执行无返回");
+
+  // Session 过期：在 background 层等待重登录再重试
+  if (result.__needRelogin__) {
+    console.warn("[BrowserMCP 淘宝] Session 已过期，等待重新登录...");
+
+    // 显示红色横幅
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+          if (document.getElementById("browsermcp-login-banner")) return;
+          const banner = document.createElement("div");
+          banner.id = "browsermcp-login-banner";
+          banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#e84040;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
+          banner.textContent = "🔗 Browser MCP：淘宝登录已过期，请重新登录，登录后将自动继续...";
+          document.body.appendChild(banner);
+        },
+      });
+    } catch { /* 忽略 */ }
+
+    // 每 5 秒重试一次 API，直到成功或超时（60 秒）
+    const startedAt = Date.now();
+    let retryResult: { data?: unknown; error?: string; __needRelogin__?: boolean } | undefined;
+    while (Date.now() - startedAt < 60_000) {
+      await new Promise(r => setTimeout(r, 5_000));
+      console.log("[BrowserMCP 淘宝] 重试中...");
+      try {
+        const retryResults = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          func: taobaoOrdersMainWorldFunc,
+          args: [params],
+        });
+        retryResult = retryResults?.[0]?.result as typeof retryResult;
+        // 不再报 session 过期，说明登录成功了
+        if (retryResult && !retryResult.__needRelogin__) break;
+      } catch { /* Tab 可能在跳转，忽略后继续等 */ }
+    }
+
+    // 移除横幅
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => document.getElementById("browsermcp-login-banner")?.remove(),
+      });
+    } catch { /* 忽略 */ }
+
+    if (!retryResult || retryResult.__needRelogin__) {
+      throw new Error("等待重新登录超时（60s），请重新登录淘宝后再试");
+    }
+    if (retryResult.error) throw new Error(retryResult.error);
+    return retryResult.data;
+  }
+
   if (result.error) throw new Error(result.error);
   return result.data;
 }
@@ -216,45 +403,16 @@ async function deepseekMainWorldFunc(params: Record<string, unknown>) {
       button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     };
 
+    // 登录检测已在 background 层的 ensureDeepSeekLoggedIn() 完成
+    // 此处仅做快速检测，超时直接报错
     const textarea = await waitFor(getTextarea, 10_000);
     if (!textarea) {
-      // 可能是未登录，检查页面是否有登录相关元素
-      const isLoginPage = !!document.querySelector('input[type="password"]')
-        || !!document.querySelector('[class*="login"]')
-        || window.location.href.includes("/login");
-
-      if (isLoginPage) {
-        console.warn("[BrowserMCP DeepSeek] 未检测到登录态，请在页面中完成登录，等待中...");
-        // 弹出提示横幅
-        try {
-          const banner = document.createElement("div");
-          banner.id = "browsermcp-login-banner";
-          banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
-          banner.textContent = "🔗 Browser MCP：请登录 DeepSeek，登录后将自动继续...";
-          document.body.appendChild(banner);
-        } catch { /* 忽略 */ }
-
-        // 登录后页面通常会跳转，等待输入框出现（最多 60 秒）
-        const textareaAfterLogin = await waitFor(getTextarea, 60_000, 2_000);
-
-        // 移除提示横幅
-        try { document.getElementById("browsermcp-login-banner")?.remove(); } catch { /* 忽略 */ }
-
-        if (!textareaAfterLogin) {
-          return { error: "[DeepSeek] 等待登录超时（60s），请先登录 DeepSeek 后再试" };
-        }
-
-        console.log("[BrowserMCP DeepSeek] 登录态已检测到，继续执行");
-        // 用登录后找到的 textarea 继续流程
-        return await doSendMessage(textareaAfterLogin);
-      }
-
-      return { error: "[DeepSeek] 未找到输入框，请确认页面已完全加载并已登录" };
+      return { error: "[DeepSeek] 未找到输入框，请确认页面已完全加载" };
     }
 
     return await doSendMessage(textarea);
 
-    // 将发送消息逻辑提取为内部函数，避免登录等待后重复代码
+    // 发送消息
     async function doSendMessage(ta: HTMLTextAreaElement) {
 
     ta.focus();
@@ -427,40 +585,11 @@ async function taobaoOrdersMainWorldFunc(params: Record<string, unknown>) {
   }
 
   // ---- 主逻辑 ----
+  // 注意：登录检测已在 background 层的 ensureTaobaoLoggedIn() 完成
+  // 此处直接读取 cookie 获取 token
   try {
-    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-    // 登录检测：等待 _m_h5_tk cookie 出现（最多 60 秒）
-    const LOGIN_TIMEOUT_MS = 60_000;
-    const LOGIN_CHECK_INTERVAL_MS = 3_000;
-    const loginStartedAt = Date.now();
-    let match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
-
-    if (!match) {
-      console.warn("[BrowserMCP 淘宝] 未检测到登录态，请在页面中完成登录，等待中...");
-      // 尝试弹出提示（不阻塞流程）
-      try {
-        const banner = document.createElement("div");
-        banner.id = "browsermcp-login-banner";
-        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
-        banner.textContent = "🔗 Browser MCP：请登录淘宝，登录后将自动继续获取数据...";
-        document.body.appendChild(banner);
-      } catch { /* 忽略 DOM 操作异常 */ }
-
-      while (Date.now() - loginStartedAt < LOGIN_TIMEOUT_MS) {
-        await sleep(LOGIN_CHECK_INTERVAL_MS);
-        match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
-        if (match) break;
-      }
-
-      // 移除提示横幅
-      try { document.getElementById("browsermcp-login-banner")?.remove(); } catch { /* 忽略 */ }
-
-      if (!match) {
-        return { error: "等待登录超时（60s），请先登录淘宝后再试" };
-      }
-      console.log("[BrowserMCP 淘宝] 登录态已检测到，继续获取数据");
-    }
+    const match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
+    if (!match) return { error: "未找到登录 cookie，请刷新页面后重试" };
 
     const token = match[1].split("_")[0];
 
@@ -475,53 +604,45 @@ async function taobaoOrdersMainWorldFunc(params: Record<string, unknown>) {
       __needlessClearProtocol__: true,
     });
 
-    const t = Date.now().toString();
     const appKey = "12574478";
-    const sign = md5(token + "&" + t + "&" + appKey + "&" + data);
 
-    const query = new URLSearchParams({
-      jsv: "2.7.2", appKey, v: "1.0", ecode: "1", timeout: "8000",
-      dataType: "json", valueType: "original", ttid: "1@tbwang_mac_1.0.0#pc",
-      needLogin: "true", type: "originaljson", isHttps: "1", needRetry: "true",
-      t, sign,
-    });
+    // 发起 mtop 请求（带签名）
+    const doRequest = async (tk: string) => {
+      const t = Date.now().toString();
+      const sign = md5(tk + "&" + t + "&" + appKey + "&" + data);
+      const query = new URLSearchParams({
+        jsv: "2.7.2", appKey, v: "1.0", ecode: "1", timeout: "8000",
+        dataType: "json", valueType: "original", ttid: "1@tbwang_mac_1.0.0#pc",
+        needLogin: "true", type: "originaljson", isHttps: "1", needRetry: "true",
+        t, sign,
+      });
+      const url = "https://h5api.m.taobao.com/h5/mtop.taobao.order.queryboughtlistv2/1.0/?" + query.toString();
+      const r = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "data=" + encodeURIComponent(data),
+      });
+      return r.json() as Promise<Record<string, unknown>>;
+    };
 
-    const url = "https://h5api.m.taobao.com/h5/mtop.taobao.order.queryboughtlistv2/1.0/?" + query.toString();
+    let json = await doRequest(token);
+    const ret = json.ret as string[] | undefined;
 
-    return fetch(url, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "data=" + encodeURIComponent(data),
-    })
-    .then(r => r.json())
-    .then((json: Record<string, unknown>) => {
-      const ret = json.ret as string[] | undefined;
+    // Token 过期：重读 cookie 重试一次
+    if (Array.isArray(ret) && ret.some(r => /FAIL_SYS_TOKEN_EXPIRED|FAIL_SYS_TOKEN_EMPTY/.test(r))) {
+      const m2 = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
+      if (!m2) return { error: "Token 续期失败" };
+      json = await doRequest(m2[1].split("_")[0]);
+    }
 
-      // Token 续期重试
-      if (Array.isArray(ret) && ret.some(r => /FAIL_SYS_TOKEN_EXPIRED|FAIL_SYS_TOKEN_EMPTY/.test(r))) {
-        // 重读 cookie 重试
-        const m2 = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
-        if (!m2) return { error: "Token 续期失败" };
-        const token2 = m2[1].split("_")[0];
-        const t2 = Date.now().toString();
-        const sign2 = md5(token2 + "&" + t2 + "&" + appKey + "&" + data);
-        const q2 = new URLSearchParams({
-          jsv: "2.7.2", appKey, v: "1.0", ecode: "1", timeout: "8000",
-          dataType: "json", valueType: "original", ttid: "1@tbwang_mac_1.0.0#pc",
-          needLogin: "true", type: "originaljson", isHttps: "1", needRetry: "true",
-          t: t2, sign: sign2,
-        });
-        const url2 = "https://h5api.m.taobao.com/h5/mtop.taobao.order.queryboughtlistv2/1.0/?" + q2.toString();
-        return fetch(url2, {
-          method: "POST", credentials: "include",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: "data=" + encodeURIComponent(data),
-        }).then(r => r.json()).then(parseResult);
-      }
+    // Session 过期：返回特殊标记，由 background 层处理重登录
+    const retAfterTokenRetry = json.ret as string[] | undefined;
+    if (Array.isArray(retAfterTokenRetry) && retAfterTokenRetry.some(r => /FAIL_SYS_SESSION_EXPIRED/.test(r))) {
+      return { __needRelogin__: true };
+    }
 
-      return parseResult(json);
-    });
+    return parseResult(json);
   } catch (e) {
     return { error: (e as Error).message };
   }

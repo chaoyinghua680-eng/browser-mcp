@@ -218,23 +218,59 @@ async function deepseekMainWorldFunc(params: Record<string, unknown>) {
 
     const textarea = await waitFor(getTextarea, 10_000);
     if (!textarea) {
+      // 可能是未登录，检查页面是否有登录相关元素
+      const isLoginPage = !!document.querySelector('input[type="password"]')
+        || !!document.querySelector('[class*="login"]')
+        || window.location.href.includes("/login");
+
+      if (isLoginPage) {
+        console.warn("[BrowserMCP DeepSeek] 未检测到登录态，请在页面中完成登录，等待中...");
+        // 弹出提示横幅
+        try {
+          const banner = document.createElement("div");
+          banner.id = "browsermcp-login-banner";
+          banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
+          banner.textContent = "🔗 Browser MCP：请登录 DeepSeek，登录后将自动继续...";
+          document.body.appendChild(banner);
+        } catch { /* 忽略 */ }
+
+        // 登录后页面通常会跳转，等待输入框出现（最多 60 秒）
+        const textareaAfterLogin = await waitFor(getTextarea, 60_000, 2_000);
+
+        // 移除提示横幅
+        try { document.getElementById("browsermcp-login-banner")?.remove(); } catch { /* 忽略 */ }
+
+        if (!textareaAfterLogin) {
+          return { error: "[DeepSeek] 等待登录超时（60s），请先登录 DeepSeek 后再试" };
+        }
+
+        console.log("[BrowserMCP DeepSeek] 登录态已检测到，继续执行");
+        // 用登录后找到的 textarea 继续流程
+        return await doSendMessage(textareaAfterLogin);
+      }
+
       return { error: "[DeepSeek] 未找到输入框，请确认页面已完全加载并已登录" };
     }
 
-    textarea.focus();
+    return await doSendMessage(textarea);
+
+    // 将发送消息逻辑提取为内部函数，避免登录等待后重复代码
+    async function doSendMessage(ta: HTMLTextAreaElement) {
+
+    ta.focus();
     const nativeSetter = Object.getOwnPropertyDescriptor(
       window.HTMLTextAreaElement.prototype,
       "value"
     )?.set;
 
     if (nativeSetter) {
-      nativeSetter.call(textarea, message);
+      nativeSetter.call(ta, message);
     } else {
-      textarea.value = message;
+      ta.value = message;
     }
 
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    ta.dispatchEvent(new Event("change", { bubbles: true }));
 
     const sendButton = await waitFor(getSendButton, 3_000);
     if (!sendButton) {
@@ -326,6 +362,7 @@ async function deepseekMainWorldFunc(params: Record<string, unknown>) {
     }
 
     return { data: { content } };
+    } // end doSendMessage
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     return { error: "[DeepSeek] 执行异常: " + message };
@@ -334,7 +371,7 @@ async function deepseekMainWorldFunc(params: Record<string, unknown>) {
 
 // 此函数会被序列化后在页面 MAIN world 中执行
 // 不能引用外部变量，必须完全自包含
-function taobaoOrdersMainWorldFunc(params: Record<string, unknown>) {
+async function taobaoOrdersMainWorldFunc(params: Record<string, unknown>) {
   // ---- MD5 ----
   function md5(str: string): string {
     function safeAdd(x: number, y: number) {
@@ -391,8 +428,40 @@ function taobaoOrdersMainWorldFunc(params: Record<string, unknown>) {
 
   // ---- 主逻辑 ----
   try {
-    const match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
-    if (!match) return { error: "未找到 _m_h5_tk cookie，请确认已登录淘宝" };
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // 登录检测：等待 _m_h5_tk cookie 出现（最多 60 秒）
+    const LOGIN_TIMEOUT_MS = 60_000;
+    const LOGIN_CHECK_INTERVAL_MS = 3_000;
+    const loginStartedAt = Date.now();
+    let match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
+
+    if (!match) {
+      console.warn("[BrowserMCP 淘宝] 未检测到登录态，请在页面中完成登录，等待中...");
+      // 尝试弹出提示（不阻塞流程）
+      try {
+        const banner = document.createElement("div");
+        banner.id = "browsermcp-login-banner";
+        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#6366f1;color:#fff;text-align:center;padding:12px;font-size:15px;font-weight:600;";
+        banner.textContent = "🔗 Browser MCP：请登录淘宝，登录后将自动继续获取数据...";
+        document.body.appendChild(banner);
+      } catch { /* 忽略 DOM 操作异常 */ }
+
+      while (Date.now() - loginStartedAt < LOGIN_TIMEOUT_MS) {
+        await sleep(LOGIN_CHECK_INTERVAL_MS);
+        match = document.cookie.match(/(?:^|;\s*)_m_h5_tk=([^;]+)/);
+        if (match) break;
+      }
+
+      // 移除提示横幅
+      try { document.getElementById("browsermcp-login-banner")?.remove(); } catch { /* 忽略 */ }
+
+      if (!match) {
+        return { error: "等待登录超时（60s），请先登录淘宝后再试" };
+      }
+      console.log("[BrowserMCP 淘宝] 登录态已检测到，继续获取数据");
+    }
+
     const token = match[1].split("_")[0];
 
     const pageNum = (params as { pageNum?: number })?.pageNum ?? 1;
